@@ -1,0 +1,11 @@
+.env
+client/node_modules/
+client/dist/
+client/*.tsbuildinfo
+client/src/*.js
+client-stage/
+release-stage/
+release/
+build/
+*.exe
+*.log
