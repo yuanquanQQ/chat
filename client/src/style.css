@@ -18,6 +18,18 @@
 .messages .msg .bubble small{display:block;color:#8a94a6;font-size:11px;margin-bottom:4px}
 .messages .msg.mine .bubble small{color:#ffffffb3}
 .messages .msg .bubble p{margin:0;line-height:1.5;word-break:break-word;background:none;border:0;box-shadow:none;padding:0;color:inherit}
+.tabs{display:flex;gap:8px;margin-bottom:14px}
+.tabs button{border:1px solid #dce1eb;background:#fff;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px;color:#4a5568}
+.tabs button.tabon{background:var(--primary);border-color:var(--primary);color:#fff}
+.row-actions{display:flex;gap:8px;flex-shrink:0}
+.pu-reject{border:0;border-radius:8px;background:#d44444;color:#fff;padding:8px 14px;cursor:pointer;white-space:nowrap}
+.pu-approve.wide{width:100%;margin-top:4px}
+.pending-panel h4{margin:16px 0 8px;font-size:14px;color:#4a5568}
+.pending-panel input,.pending-panel textarea{padding:11px;border:1px solid #dce1eb;border-radius:9px;outline:none;font:inherit;margin-bottom:10px}
+.grp-row{display:flex;gap:8px;align-items:center}
+.grp-row input{flex:1}
+.grp-actions{margin-top:18px;display:flex;gap:10px}
+
 
 
 

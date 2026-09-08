@@ -39,6 +39,20 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.Handle("POST /api/v1/admin/users/{id}/approve", s.require("admin", http.HandlerFunc(s.approveUser)))
 	mux.Handle("GET /api/v1/conversations", s.require("", http.HandlerFunc(s.conversations)))
 	mux.Handle("POST /api/v1/conversations", s.require("", http.HandlerFunc(s.createConversation)))
+	mux.Handle("POST /api/v1/conversations/{id}/members", s.require("", http.HandlerFunc(s.addMembers)))
+	mux.Handle("GET /api/v1/conversations/{id}/members", s.require("", http.HandlerFunc(s.conversationMembers)))
+	mux.Handle("DELETE /api/v1/conversations/{id}/members/{userId}", s.require("", http.HandlerFunc(s.removeMember)))
+	mux.Handle("PATCH /api/v1/conversations/{id}", s.require("", http.HandlerFunc(s.renameConversation)))
+	mux.Handle("DELETE /api/v1/conversations/{id}", s.require("", http.HandlerFunc(s.disbandConversation)))
+	mux.Handle("POST /api/v1/me/department-request", s.require("", http.HandlerFunc(s.departmentRequest)))
+	mux.Handle("GET /api/v1/admin/department-requests", s.require("admin", http.HandlerFunc(s.departmentRequests)))
+	mux.Handle("POST /api/v1/admin/department-requests/{id}/approve", s.require("admin", http.HandlerFunc(s.approveDepartmentRequest)))
+	mux.Handle("POST /api/v1/admin/department-requests/{id}/reject", s.require("admin", http.HandlerFunc(s.rejectDepartmentRequest)))
+	mux.Handle("GET /api/v1/admin/users", s.require("admin", http.HandlerFunc(s.adminUsers)))
+	mux.Handle("POST /api/v1/admin/users/{id}/reject", s.require("admin", http.HandlerFunc(s.rejectUser)))
+	mux.Handle("POST /api/v1/admin/users/{id}/disable", s.require("admin", http.HandlerFunc(s.disableUser)))
+	mux.Handle("POST /api/v1/admin/users/{id}/enable", s.require("admin", http.HandlerFunc(s.enableUser)))
+	mux.Handle("POST /api/v1/admin/users/{id}/reset-password", s.require("admin", http.HandlerFunc(s.resetPassword)))
 	mux.Handle("GET /api/v1/users", s.require("", http.HandlerFunc(s.users)))
 	mux.Handle("GET /api/v1/me", s.require("", http.HandlerFunc(s.me)))
 	mux.Handle("GET /api/v1/conversations/{id}/messages", s.require("", http.HandlerFunc(s.messages)))
@@ -408,6 +422,283 @@ func (s *server) retractMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	s.publishConversation(r.Context(), cid, "message.retracted", map[string]string{"id": id, "conversationId": cid})
 	w.WriteHeader(204)
+}
+
+func (s *server) canManage(ctx context.Context, cid, uid string) bool {
+	var role string
+	_ = s.db.Pool.QueryRow(ctx, `SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, cid, uid).Scan(&role)
+	return role == "owner" || role == "admin"
+}
+
+func (s *server) addMembers(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	cid := r.PathValue("id")
+	if !s.canManage(r.Context(), cid, p.UserID) {
+		problem(w, 403, "需要群主或管理员权限")
+		return
+	}
+	var in struct{ UserIDs []string }
+	if !decode(w, r, &in) {
+		return
+	}
+	for _, uid := range in.UserIDs {
+		if uid == p.UserID {
+			continue
+		}
+		_, _ = s.db.Pool.Exec(r.Context(), `INSERT INTO conversation_members(conversation_id,user_id) SELECT $1,id FROM users WHERE id=$2 AND status='active' ON CONFLICT DO NOTHING`, cid, uid)
+	}
+	s.publishConversation(r.Context(), cid, "conversation.updated", map[string]string{"id": cid})
+	w.WriteHeader(204)
+}
+
+func (s *server) removeMember(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	cid := r.PathValue("id")
+	uid := r.PathValue("userId")
+	if uid == p.UserID {
+		var role string
+		_ = s.db.Pool.QueryRow(r.Context(), `SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, cid, uid).Scan(&role)
+		if role == "owner" {
+			problem(w, 409, "群主不能退出群聊，请先转让或解散群聊")
+			return
+		}
+	} else if !s.canManage(r.Context(), cid, p.UserID) {
+		problem(w, 403, "需要群主或管理员权限")
+		return
+	}
+	tag, err := s.db.Pool.Exec(r.Context(), `DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, cid, uid)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "成员不存在")
+		return
+	}
+	s.publishConversation(r.Context(), cid, "conversation.updated", map[string]string{"id": cid})
+	w.WriteHeader(204)
+}
+
+func (s *server) renameConversation(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	cid := r.PathValue("id")
+	if !s.canManage(r.Context(), cid, p.UserID) {
+		problem(w, 403, "需要群主或管理员权限")
+		return
+	}
+	var in struct{ Name string }
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		problem(w, 400, "群聊名称不能为空")
+		return
+	}
+	tag, err := s.db.Pool.Exec(r.Context(), `UPDATE conversations SET name=$1 WHERE id=$2 AND kind='group'`, in.Name, cid)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "会话不存在")
+		return
+	}
+	s.publishConversation(r.Context(), cid, "conversation.updated", map[string]string{"id": cid})
+	jsonOut(w, 200, map[string]string{"id": cid, "name": in.Name})
+}
+
+func (s *server) disbandConversation(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	cid := r.PathValue("id")
+	var role string
+	_ = s.db.Pool.QueryRow(r.Context(), `SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, cid, p.UserID).Scan(&role)
+	if role != "owner" {
+		problem(w, 403, "只有群主可以解散群聊")
+		return
+	}
+	tag, err := s.db.Pool.Exec(r.Context(), `DELETE FROM conversations WHERE id=$1 AND kind='group'`, cid)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "会话不存在")
+		return
+	}
+	s.publishConversation(r.Context(), cid, "conversation.updated", map[string]string{"id": cid})
+	w.WriteHeader(204)
+}
+
+func (s *server) departmentRequest(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	var in struct{ Department, Reason string }
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Department = strings.TrimSpace(in.Department)
+	in.Reason = strings.TrimSpace(in.Reason)
+	if in.Department == "" || in.Reason == "" {
+		problem(w, 400, "目标部门和理由必填")
+		return
+	}
+	var exists bool
+	_ = s.db.Pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM department_change_requests WHERE user_id=$1 AND status='pending')`, p.UserID).Scan(&exists)
+	if exists {
+		problem(w, 409, "已有待审批的转部门申请")
+		return
+	}
+	var deptID string
+	tx, err := s.db.Pool.Begin(r.Context())
+	if err != nil {
+		problem(w, 500, "提交失败")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err = tx.QueryRow(r.Context(), `INSERT INTO departments(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id`, in.Department).Scan(&deptID); err != nil {
+		problem(w, 500, "提交失败")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `INSERT INTO department_change_requests(user_id,target_department_id,reason) VALUES($1,$2,$3)`, p.UserID, deptID, in.Reason); err != nil {
+		problem(w, 500, "提交失败")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		problem(w, 500, "提交失败")
+		return
+	}
+	jsonOut(w, 201, map[string]string{"status": "pending"})
+}
+
+func (s *server) departmentRequests(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT r.id,u.username,u.real_name,d.name,r.reason,r.created_at FROM department_change_requests r JOIN users u ON u.id=r.user_id JOIN departments d ON d.id=r.target_department_id WHERE r.status='pending' ORDER BY r.created_at`)
+	if err != nil {
+		problem(w, 500, "查询失败")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, uname, real, dept, reason string
+		var created time.Time
+		if rows.Scan(&id, &uname, &real, &dept, &reason, &created) == nil {
+			items = append(items, map[string]any{"id": id, "username": uname, "realName": real, "targetDepartment": dept, "reason": reason, "createdAt": created})
+		}
+	}
+	jsonOut(w, 200, items)
+}
+
+func (s *server) approveDepartmentRequest(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	id := r.PathValue("id")
+	tx, err := s.db.Pool.Begin(r.Context())
+	if err != nil {
+		problem(w, 500, "审批失败")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	tag, err := tx.Exec(r.Context(), `UPDATE department_change_requests SET status='approved',reviewed_by=$1,reviewed_at=now() WHERE id=$2 AND status='pending'`, p.UserID, id)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "申请不存在")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE users SET department_id=(SELECT target_department_id FROM department_change_requests WHERE id=$1),updated_at=now() WHERE id=(SELECT user_id FROM department_change_requests WHERE id=$1)`, id); err != nil {
+		problem(w, 500, "审批失败")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		problem(w, 500, "审批失败")
+		return
+	}
+	_, _ = s.db.Pool.Exec(r.Context(), `INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES($1,'dept.approved','department_change_request',$2)`, p.UserID, id)
+	w.WriteHeader(204)
+}
+
+func (s *server) rejectDepartmentRequest(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	id := r.PathValue("id")
+	tag, err := s.db.Pool.Exec(r.Context(), `UPDATE department_change_requests SET status='rejected',reviewed_by=$1,reviewed_at=now() WHERE id=$2 AND status='pending'`, p.UserID, id)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "申请不存在")
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (s *server) adminUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT u.id,u.username,u.real_name,coalesce(d.name,''),u.status,u.created_at FROM users u LEFT JOIN departments d ON d.id=u.department_id ORDER BY u.created_at`)
+	if err != nil {
+		problem(w, 500, "查询失败")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, uname, real, dept, status string
+		var created time.Time
+		if rows.Scan(&id, &uname, &real, &dept, &status, &created) == nil {
+			items = append(items, map[string]any{"id": id, "username": uname, "realName": real, "department": dept, "status": status, "createdAt": created})
+		}
+	}
+	jsonOut(w, 200, items)
+}
+
+func (s *server) rejectUser(w http.ResponseWriter, r *http.Request) {
+	s.adminStatusUpdate(w, r, "pending", "rejected")
+}
+func (s *server) disableUser(w http.ResponseWriter, r *http.Request) {
+	s.adminStatusUpdate(w, r, "active", "disabled")
+}
+func (s *server) enableUser(w http.ResponseWriter, r *http.Request) {
+	s.adminStatusUpdate(w, r, "disabled", "active")
+}
+
+func (s *server) adminStatusUpdate(w http.ResponseWriter, r *http.Request, from, to string) {
+	p := who(r)
+	id := r.PathValue("id")
+	tag, err := s.db.Pool.Exec(r.Context(), `UPDATE users SET status=$1,updated_at=now() WHERE id=$2 AND status=$3`, to, id, from)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 409, "用户当前状态不允许该操作")
+		return
+	}
+	_, _ = s.db.Pool.Exec(r.Context(), `INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES($1,'user.'||$2,'user',$3)`, p.UserID, to, id)
+	w.WriteHeader(204)
+}
+
+func (s *server) resetPassword(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	id := r.PathValue("id")
+	var in struct{ NewPassword string }
+	if !decode(w, r, &in) {
+		return
+	}
+	if len(in.NewPassword) < 8 || len([]byte(in.NewPassword)) > 72 {
+		problem(w, 400, "新密码至少 8 位、不超过 72 字节")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		problem(w, 500, "重置失败")
+		return
+	}
+	tag, err := s.db.Pool.Exec(r.Context(), `UPDATE users SET password_hash=$1,updated_at=now() WHERE id=$2`, string(hash), id)
+	if err != nil || tag.RowsAffected() == 0 {
+		problem(w, 404, "用户不存在")
+		return
+	}
+	_, _ = s.db.Pool.Exec(r.Context(), `INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES($1,'user.password_reset','user',$2)`, p.UserID, id)
+	w.WriteHeader(204)
+}
+
+func (s *server) conversationMembers(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	cid := r.PathValue("id")
+	if !s.isMember(r.Context(), cid, p.UserID) {
+		problem(w, 403, "无权访问该会话")
+		return
+	}
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT u.id,u.username,u.real_name,m.role FROM conversation_members m JOIN users u ON u.id=m.user_id WHERE m.conversation_id=$1 ORDER BY m.joined_at`, cid)
+	if err != nil {
+		problem(w, 500, "查询失败")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, uname, real, role string
+		if rows.Scan(&id, &uname, &real, &role) == nil {
+			items = append(items, map[string]any{"id": id, "username": uname, "realName": real, "role": role})
+		}
+	}
+	jsonOut(w, 200, items)
 }
 
 func (s *server) isMember(ctx context.Context, cid, uid string) bool {
