@@ -37,7 +37,16 @@ func main() {
 		slog.Error("initial administrator failed", "error", err)
 		os.Exit(1)
 	}
-	handler := app.New(cfg, db)
+	var minio *store.Minio
+	if m, err := store.NewMinio(cfg.MinIOEndpoint, cfg.MinIOAccessKey, cfg.MinIOSecret, cfg.MinIOBucket, cfg.MinIOUseSSL); err != nil {
+		slog.Warn("minio client unavailable, file upload disabled", "error", err)
+	} else if err := m.EnsureBucket(ctx); err != nil {
+		slog.Warn("minio bucket unavailable, file upload disabled", "error", err)
+	} else {
+		minio = m
+		slog.Info("minio ready", "endpoint", cfg.MinIOEndpoint, "bucket", cfg.MinIOBucket)
+	}
+	handler := app.New(cfg, db, minio)
 	server := &http.Server{Addr: cfg.ListenAddress, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		slog.Info("chat server listening", "address", cfg.ListenAddress)

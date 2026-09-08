@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,17 +25,18 @@ import (
 )
 
 type server struct {
-	cfg config.Config
-	db  *store.Store
-	hub *hub
+	cfg   config.Config
+	db    *store.Store
+	minio *store.Minio
+	hub   *hub
 }
 type principal struct{ UserID, Role, TokenID string }
 type contextKey string
 
 const principalKey contextKey = "principal"
 
-func New(cfg config.Config, db *store.Store) http.Handler {
-	s := &server{cfg: cfg, db: db, hub: newHub()}
+func New(cfg config.Config, db *store.Store, minio *store.Minio) http.Handler {
+	s := &server{cfg: cfg, db: db, minio: minio, hub: newHub()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("POST /api/v1/auth/register", s.register)
@@ -60,6 +66,10 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.Handle("POST /api/v1/messages/{id}/read", s.require("", http.HandlerFunc(s.readMessage)))
 	mux.Handle("POST /api/v1/messages/{id}/retract", s.require("", http.HandlerFunc(s.retractMessage)))
 	mux.Handle("POST /api/v1/files/prepare", s.require("", http.HandlerFunc(s.prepareFile)))
+	mux.Handle("POST /api/v1/files/uploads", s.require("", http.HandlerFunc(s.uploadFile)))
+	mux.Handle("POST /api/v1/files/{id}/store-to-server", s.require("", http.HandlerFunc(s.storeFileToServer)))
+	mux.Handle("GET /api/v1/files/{id}/download", s.require("", http.HandlerFunc(s.downloadFile)))
+	mux.Handle("GET /api/v1/search", s.require("", http.HandlerFunc(s.searchMessages)))
 	mux.Handle("GET /ws", s.require("", http.HandlerFunc(s.websocket)))
 	return recoverAndCORS(mux)
 }
@@ -328,8 +338,174 @@ func (s *server) prepareFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"id": id, "storageMode": mode, "thresholdBytes": threshold, "uploadRequired": mode == "server"}
-	// 服务器模式下一阶段由 MinIO 适配器返回预签名 URL；当前不会假装上传已经完成。
 	jsonOut(w, 201, out)
+}
+
+func fileTypeByMime(mime string) string {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "image"
+	case strings.HasPrefix(mime, "video/"):
+		return "video"
+	case strings.HasPrefix(mime, "audio/"):
+		return "audio"
+	default:
+		return "file"
+	}
+}
+
+func (s *server) uploadFile(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	if s.minio == nil {
+		problem(w, 503, "文件服务暂不可用")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, (100<<20)+(4<<20))
+	if err := r.ParseMultipartForm((100 << 20) + (4 << 20)); err != nil {
+		problem(w, 400, "上传失败：文件不能超过 100MB")
+		return
+	}
+	cid := r.FormValue("conversationId")
+	if !s.isMember(r.Context(), cid, p.UserID) {
+		problem(w, 403, "无权访问该会话")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		problem(w, 400, "缺少文件")
+		return
+	}
+	defer file.Close()
+	if header.Size < 0 || header.Size > 100<<20 {
+		problem(w, 400, "单个文件不能超过 100MB，大文件请使用客户端存储")
+		return
+	}
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = mime.TypeByExtension(filepath.Ext(header.Filename))
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	id := uuid.NewString()
+	if err := s.minio.Put(r.Context(), id, file, header.Size, mimeType); err != nil {
+		slog.Error("minio put failed", "file", id, "error", err)
+		problem(w, 500, "上传失败")
+		return
+	}
+	if _, err = s.db.Pool.Exec(r.Context(), `INSERT INTO files(id,conversation_id,uploader_id,name,size_bytes,mime_type,storage_mode,object_key,available) VALUES($1,$2,$3,$4,$5,$6,'server',$7,true)`, id, cid, p.UserID, header.Filename, header.Size, mimeType, id); err != nil {
+		slog.Error("files insert failed", "file", id, "error", err)
+		problem(w, 500, "上传失败")
+		return
+	}
+	jsonOut(w, 201, map[string]any{"id": id, "name": header.Filename, "sizeBytes": header.Size, "mimeType": mimeType, "storageMode": "server", "type": fileTypeByMime(mimeType)})
+}
+
+func (s *server) downloadFile(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	id := r.PathValue("id")
+	var cid, name, mimeType, storageMode, objectKey string
+	err := s.db.Pool.QueryRow(r.Context(), `SELECT conversation_id,name,mime_type,storage_mode,object_key FROM files WHERE id=$1`, id).Scan(&cid, &name, &mimeType, &storageMode, &objectKey)
+	if err != nil {
+		problem(w, 404, "文件不存在")
+		return
+	}
+	if !s.isMember(r.Context(), cid, p.UserID) {
+		problem(w, 403, "无权访问该文件")
+		return
+	}
+	if storageMode != "server" || objectKey == "" {
+		problem(w, 409, "该文件保存在发送者客户端，暂不可下载")
+		return
+	}
+	obj, err := s.minio.Get(r.Context(), objectKey)
+	if err != nil {
+		problem(w, 404, "文件内容不存在")
+		return
+	}
+	defer obj.Close()
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Disposition", "inline; filename*=UTF-8''"+url.PathEscape(name))
+	_, _ = io.Copy(w, obj)
+}
+
+func (s *server) storeFileToServer(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	id := r.PathValue("id")
+	if s.minio == nil {
+		problem(w, 503, "文件服务暂不可用")
+		return
+	}
+	var cid, storageMode string
+	err := s.db.Pool.QueryRow(r.Context(), `SELECT conversation_id,storage_mode FROM files WHERE id=$1`, id).Scan(&cid, &storageMode)
+	if err != nil {
+		problem(w, 404, "文件不存在")
+		return
+	}
+	if !s.isMember(r.Context(), cid, p.UserID) {
+		problem(w, 403, "无权访问该文件")
+		return
+	}
+	if storageMode == "server" {
+		problem(w, 409, "文件已保存在服务器")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, (10<<30)+(4<<20))
+	if err := r.ParseMultipartForm((10 << 30) + (4 << 20)); err != nil {
+		problem(w, 400, "上传失败")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		problem(w, 400, "缺少文件")
+		return
+	}
+	defer file.Close()
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	if err := s.minio.Put(r.Context(), id, file, header.Size, mimeType); err != nil {
+		problem(w, 500, "上传失败")
+		return
+	}
+	_, err = s.db.Pool.Exec(r.Context(), `UPDATE files SET storage_mode='server',object_key=$1,size_bytes=$2,mime_type=$3,available=true WHERE id=$4`, id, header.Size, mimeType, id)
+	if err != nil {
+		slog.Error("files store-to-server update failed", "file", id, "error", err)
+		problem(w, 500, "转存失败")
+		return
+	}
+	s.publishConversation(r.Context(), cid, "file.stored", map[string]string{"id": id, "conversationId": cid})
+	jsonOut(w, 200, map[string]string{"id": id, "storageMode": "server"})
+}
+
+func (s *server) searchMessages(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		jsonOut(w, 200, []any{})
+		return
+	}
+	if len([]byte(q)) > 200 {
+		problem(w, 400, "搜索词过长")
+		return
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT m.id,m.conversation_id,coalesce(c.name,''),u.real_name,m.content,m.created_at FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN conversation_members me ON me.conversation_id=c.id AND me.user_id=$1 JOIN users u ON u.id=m.sender_id WHERE m.retracted_at IS NULL AND m.content ILIKE '%'||$2||'%' ESCAPE '\' ORDER BY m.created_at DESC LIMIT 50`, p.UserID, escaped)
+	if err != nil {
+		problem(w, 500, "搜索失败")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, cid, cname, sender, content string
+		var created time.Time
+		if rows.Scan(&id, &cid, &cname, &sender, &content, &created) == nil {
+			items = append(items, map[string]any{"id": id, "conversationId": cid, "conversationName": cname, "senderName": sender, "content": content, "createdAt": created})
+		}
+	}
+	jsonOut(w, 200, items)
 }
 
 func (s *server) messages(w http.ResponseWriter, r *http.Request) {
@@ -344,7 +520,12 @@ func (s *server) messages(w http.ResponseWriter, r *http.Request) {
 	if before == "" {
 		before = time.Now().Add(time.Second).Format(time.RFC3339Nano)
 	}
-	rows, err := s.db.Pool.Query(r.Context(), `SELECT id,sender_id,type,content,reply_to_id,metadata,retracted_at,created_at FROM messages WHERE conversation_id=$1 AND created_at<$2 ORDER BY created_at DESC LIMIT $3`, cid, before, limit)
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT m.id,m.sender_id,m.type,m.content,m.reply_to_id,m.metadata,m.retracted_at,m.created_at,
+		coalesce(r.content,''),
+		CASE WHEN (SELECT kind FROM conversations WHERE id=$1)='direct' THEN EXISTS(SELECT 1 FROM message_reads mr WHERE mr.message_id=m.id AND mr.user_id<>m.sender_id) ELSE NULL END,
+		(SELECT count(*) FROM message_reads mr WHERE mr.message_id=m.id)
+		FROM messages m LEFT JOIN messages r ON r.id=m.reply_to_id
+		WHERE m.conversation_id=$1 AND m.created_at<$2 ORDER BY m.created_at DESC LIMIT $3`, cid, before, limit)
 	if err != nil {
 		problem(w, 500, "查询失败")
 		return
@@ -354,13 +535,16 @@ func (s *server) messages(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, sender, typ, content string
 		var reply *string
+		var replyContent string
+		var readByOther *bool
+		var readCount int
 		var retracted *time.Time
 		var metadata []byte
 		var created time.Time
-		if rows.Scan(&id, &sender, &typ, &content, &reply, &metadata, &retracted, &created) == nil {
+		if rows.Scan(&id, &sender, &typ, &content, &reply, &metadata, &retracted, &created, &replyContent, &readByOther, &readCount) == nil {
 			var meta any
 			_ = json.Unmarshal(metadata, &meta)
-			items = append(items, map[string]any{"id": id, "senderId": sender, "type": typ, "content": content, "replyToId": reply, "metadata": meta, "retractedAt": retracted, "createdAt": created})
+			items = append(items, map[string]any{"id": id, "senderId": sender, "type": typ, "content": content, "replyToId": reply, "replyToContent": replyContent, "metadata": meta, "retractedAt": retracted, "createdAt": created, "readByOther": readByOther, "readCount": readCount})
 		}
 	}
 	jsonOut(w, 200, items)
@@ -715,6 +899,9 @@ func (s *server) require(role string, next http.Handler) http.Handler {
 			if len(protocols) == 2 && protocols[0] == "bearer" {
 				raw = protocols[1]
 			}
+		}
+		if raw == "" {
+			raw = r.URL.Query().Get("token")
 		}
 		if raw == "" {
 			problem(w, 401, "需要 Bearer 凭证")
