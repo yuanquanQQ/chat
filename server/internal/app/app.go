@@ -39,6 +39,8 @@ func New(cfg config.Config, db *store.Store) http.Handler {
 	mux.Handle("POST /api/v1/admin/users/{id}/approve", s.require("admin", http.HandlerFunc(s.approveUser)))
 	mux.Handle("GET /api/v1/conversations", s.require("", http.HandlerFunc(s.conversations)))
 	mux.Handle("POST /api/v1/conversations", s.require("", http.HandlerFunc(s.createConversation)))
+	mux.Handle("GET /api/v1/users", s.require("", http.HandlerFunc(s.users)))
+	mux.Handle("GET /api/v1/me", s.require("", http.HandlerFunc(s.me)))
 	mux.Handle("GET /api/v1/conversations/{id}/messages", s.require("", http.HandlerFunc(s.messages)))
 	mux.Handle("POST /api/v1/conversations/{id}/messages", s.require("", http.HandlerFunc(s.sendMessage)))
 	mux.Handle("POST /api/v1/messages/{id}/read", s.require("", http.HandlerFunc(s.readMessage)))
@@ -171,9 +173,37 @@ func (s *server) approveUser(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+func (s *server) users(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT u.id,u.username,u.real_name,u.avatar_url,coalesce(d.name,'') FROM users u LEFT JOIN departments d ON d.id=u.department_id WHERE u.status='active' ORDER BY CASE WHEN u.id=$1 THEN 0 ELSE 1 END,d.name,u.real_name`, who(r).UserID)
+	if err != nil {
+		problem(w, 500, "查询失败")
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, uname, name, avatar, dept string
+		if rows.Scan(&id, &uname, &name, &avatar, &dept) == nil {
+			items = append(items, map[string]any{"id": id, "username": uname, "realName": name, "avatarUrl": avatar, "department": dept})
+		}
+	}
+	jsonOut(w, 200, items)
+}
+
+func (s *server) me(w http.ResponseWriter, r *http.Request) {
+	p := who(r)
+	var uname, realName, avatar, dept string
+	err := s.db.Pool.QueryRow(r.Context(), `SELECT u.username,u.real_name,u.avatar_url,coalesce(d.name,'') FROM users u LEFT JOIN departments d ON d.id=u.department_id WHERE u.id=$1`, p.UserID).Scan(&uname, &realName, &avatar, &dept)
+	if err != nil {
+		problem(w, 500, "查询失败")
+		return
+	}
+	jsonOut(w, 200, map[string]string{"id": p.UserID, "username": uname, "realName": realName, "avatarUrl": avatar, "department": dept, "role": p.Role})
+}
+
 func (s *server) conversations(w http.ResponseWriter, r *http.Request) {
 	p := who(r)
-	rows, err := s.db.Pool.Query(r.Context(), `SELECT c.id,c.kind,coalesce(c.name,''),c.created_at FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.user_id=$1 ORDER BY c.created_at DESC`, p.UserID)
+	rows, err := s.db.Pool.Query(r.Context(), `SELECT c.id,c.kind,CASE WHEN c.kind='direct' THEN (SELECT u2.real_name FROM conversation_members m2 JOIN users u2 ON u2.id=m2.user_id WHERE m2.conversation_id=c.id AND m2.user_id<>$1 LIMIT 1) ELSE coalesce(c.name,'') END,c.created_at FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.user_id=$1 ORDER BY c.created_at DESC`, p.UserID)
 	if err != nil {
 		problem(w, 500, "查询失败")
 		return
@@ -209,6 +239,14 @@ func (s *server) createConversation(w http.ResponseWriter, r *http.Request) {
 	if in.Kind == "group" && strings.TrimSpace(in.Name) == "" {
 		problem(w, 400, "群聊名称必填")
 		return
+	}
+	if in.Kind == "direct" {
+		var existing string
+		err := s.db.Pool.QueryRow(r.Context(), `SELECT c.id FROM conversations c JOIN conversation_members m1 ON m1.conversation_id=c.id AND m1.user_id=$1 JOIN conversation_members m2 ON m2.conversation_id=c.id AND m2.user_id=$2 WHERE c.kind='direct' LIMIT 1`, p.UserID, in.MemberIDs[0]).Scan(&existing)
+		if err == nil {
+			jsonOut(w, 200, map[string]any{"id": existing, "kind": "direct", "name": ""})
+			return
+		}
 	}
 	tx, err := s.db.Pool.Begin(r.Context())
 	if err != nil {

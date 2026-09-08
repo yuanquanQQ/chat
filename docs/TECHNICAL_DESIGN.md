@@ -1,8 +1,10 @@
-# 企业内网聊天技术设计（v0.1）
+# 企业内网聊天技术设计（v0.2）
 
 ## 目标
 
 为约 50 人的单一公司提供 Windows 客户端内网聊天。服务器固定在 Windows 10 + Docker，客户端使用 Electron。系统支持单聊、群聊、文本/图片/视频/文件消息、分页历史、已读、撤回、搜索，并为未来 AI 中枢和 VPN 访问保留稳定接口。
+
+客户端和服务器是两个独立交付物：客户端安装包只包含桌面 UI；服务器必须在固定内网 IP 的 Windows Docker 主机上运行。客户端登录前需要知道服务器地址。
 
 ## 模块与接口
 
@@ -18,7 +20,9 @@
 
 ## 部署
 
-客户端 -> Nginx -> Go API/WebSocket。PostgreSQL 保存业务数据，Redis 保存短期会话/在线状态，MinIO 保存服务器文件。第一期对外只暴露一个 HTTP(S) 入口；数据库、Redis、MinIO 管理口仅 Docker 网络可见。
+客户端 -> Go API/WebSocket（后续可在前面加入 Nginx）。PostgreSQL 保存业务数据，Redis 保存短期会话/在线状态，MinIO 保存服务器文件。当前 Docker Compose 对外只暴露聊天服务 8080；数据库、Redis、MinIO 管理口仅 Docker 网络可见。正式 HTTPS 和 VPN 接入属于后续运维阶段。
+
+服务器部署入口是 `deploy/server/install.ps1`：它校验 `.env`、构建 Go 镜像、启动 PostgreSQL/Redis/MinIO 和聊天服务。客户端安装入口是 `installer/Intrachat.iss`。
 
 ## 混合文件策略
 
@@ -40,3 +44,6 @@
 4. Electron 客户端完整聊天界面。
 5. 备份恢复、HTTPS、AI 指定会话转发、VPN 运维。
 
+## 当前交付边界
+
+已交付的是可启动的基础纵向切片：认证、审核、会话/消息 REST、WebSocket、数据库迁移、客户端登录和基础聊天界面。文件接口目前完成存储模式登记和 10GB 校验，真实 MinIO 分片上传、客户端大文件直连、完整管理员页面及消息高级能力仍按演进顺序实现，不能将当前客户端安装包理解为功能完整的微信替代品。

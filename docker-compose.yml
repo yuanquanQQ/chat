@@ -7,10 +7,10 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgres://chat:change-me@postgres:5432/chat?sslmode=disable
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME:?set INITIAL_ADMIN_USERNAME in .env}
-      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?set INITIAL_ADMIN_PASSWORD in .env}
+      DATABASE_URL: postgres://chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/chat?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-intrachat-default-jwt-secret-change-in-prod-2026}
+      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME:-admin}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-Intrachat-Admin-2026!ChangeMe}
     depends_on:
       postgres:
         condition: service_healthy
@@ -21,7 +21,7 @@ services:
     environment:
       POSTGRES_DB: chat
       POSTGRES_USER: chat
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -37,8 +37,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: chat-admin
-      MINIO_ROOT_PASSWORD: change-me-please
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     volumes:
       - minio-data:/data
 volumes:
