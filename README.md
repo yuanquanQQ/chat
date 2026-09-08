@@ -40,5 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\deploy\server\install.ps1
 
 ## 文档
 
+- [产品需求基线](docs/REQUIREMENTS.md)
 - [技术设计](docs/TECHNICAL_DESIGN.md)
 - [API 约定](docs/API.md)
+- [领域词汇](CONTEXT.md)
+- [服务器部署说明](deploy/server/README.md)

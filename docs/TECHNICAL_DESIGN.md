@@ -1,49 +1,60 @@
-# 企业内网聊天技术设计（v0.2）
+# 企业内网聊天技术设计（v1.0）
 
-## 目标
+## 1. 交付物和边界
 
-为约 50 人的单一公司提供 Windows 客户端内网聊天。服务器固定在 Windows 10 + Docker，客户端使用 Electron。系统支持单聊、群聊、文本/图片/视频/文件消息、分页历史、已读、撤回、搜索，并为未来 AI 中枢和 VPN 访问保留稳定接口。
+本项目由服务器和客户端两个交付物组成：服务器是项目源码、Docker Compose 和 Windows PowerShell 部署脚本；客户端是 Electron Windows 安装包。客户端没有本地聊天服务器，必须连接服务器固定内网 IP 的 8080 端口。服务器运行在 Windows 10 + Docker Desktop，未来通过 VPN 让外部用户访问同一入口。
 
-客户端和服务器是两个独立交付物：客户端安装包只包含桌面 UI；服务器必须在固定内网 IP 的 Windows Docker 主机上运行。客户端登录前需要知道服务器地址。
+## 2. 总体架构
 
-## 模块与接口
+```text
+Electron + Vue 客户端
+          │ HTTP(S) / WebSocket
+          ▼
+Go 聊天服务（唯一宿主暴露端口 8080）
+    ├── Auth：注册、审核、登录、设备会话
+    ├── Conversation：单聊、群聊、成员角色
+    ├── Message：发送、分页、搜索、已读、撤回
+    ├── Realtime：消息、已读、在线状态事件
+    ├── File：混合存储决策、元数据、授权下载
+    ├── Admin：账号、部门申请、审计
+    └── AI 预留：指定会话 HTTP 转发 seam
+          │
+          ├── PostgreSQL：持久化业务数据
+          ├── Redis：在线状态、短期状态（预留）
+          └── MinIO：服务器文件（预留适配器）
+```
 
-后端按深模块组织：调用者只依赖少量 HTTP/WebSocket 接口，认证、权限、分页、撤回窗口和存储策略藏在模块实现中。
+Nginx/HTTPS 是正式部署的后续层；第一版 Compose 直接暴露 Go 服务，数据库、Redis、MinIO 不暴露宿主端口。
 
-- `auth`：注册、审核、登录、最多 3 台设备、密码重置。
-- `conversation`：单聊/群聊、成员和群角色。
-- `message`：消息创建、分页、搜索、已读、5 分钟撤回。
-- `realtime`：WebSocket 事件分发。
-- `file`：小文件服务器存储；大文件客户端存储；用户可显式转存服务器。
-- `admin`：用户审核、部门变更、审计日志。
-- `ai`：仅预留指定会话的转发接口，第一期不启用业务逻辑。
+## 3. 模块接口与不变量
 
-## 部署
+外部调用者只依赖 REST 和 WebSocket 接口；认证、权限、消息游标、撤回窗口和文件策略隐藏在模块实现中。
 
-客户端 -> Go API/WebSocket（后续可在前面加入 Nginx）。PostgreSQL 保存业务数据，Redis 保存短期会话/在线状态，MinIO 保存服务器文件。当前 Docker Compose 对外只暴露聊天服务 8080；数据库、Redis、MinIO 管理口仅 Docker 网络可见。正式 HTTPS 和 VPN 接入属于后续运维阶段。
+- **Auth**：注册资料进入 pending；管理员审核后才可登录；密码 bcrypt；最多三台设备。
+- **Conversation**：所有消息读取和发送前验证成员资格；群成员角色为 owner/admin/member。
+- **Message**：消息属于会话和发送者；回复必须引用同会话消息；发送者只能在五分钟内撤回自己的消息。
+- **File**：先登记元数据再选择存储模式；两种模式都必须检查会话成员权限。
+- **Admin**：部门变更、账号操作和受授权查看动作写入审计日志。
 
-服务器部署入口是 `deploy/server/install.ps1`：它校验 `.env`、构建 Go 镜像、启动 PostgreSQL/Redis/MinIO 和聊天服务。客户端安装入口是 `installer/Intrachat.iss`。
+## 4. 混合文件策略
 
-## 混合文件策略
+默认阈值为 100MB，可配置。小文件实际内容放 MinIO；大文件默认由发送者客户端提供内网直连下载，发送者离线时不可用；用户可显式转存服务器以保证长期可用。服务器始终保存文件元数据、会话关系、哈希和权限。单文件上限 10GB，默认永久保存。可执行文件只当作数据传输，禁止自动打开/执行。
 
-默认阈值为 100MB，可配置。小于阈值的文件上传 MinIO；大于阈值的文件由发送者客户端提供内网直连下载，服务器只保存元数据和在线状态。发送者离线时显示“文件暂时不可用”。上传时可选择“长期保存到服务器”，将大文件转存 MinIO。可执行文件只作为数据传输，不自动打开或执行。
+文件状态：`prepared → uploading → available/failed`；客户端文件在发送者下线时变为 `unavailable`。预览只读处理图片、视频、音频、PDF 和文本；Office 第一版提供下载。
 
-## 数据保护
+## 5. 数据模型
 
-密码使用 bcrypt；访问令牌为短期 JWT；WebSocket 连接必须先认证。管理员查看聊天内容必须是指定会话授权动作，并写入审计日志。正式部署启用 HTTPS；初期可使用固定内网 IP。
+核心表：`users`、`departments`、`department_change_requests`、`user_sessions`、`conversations`、`conversation_members`、`messages`、`message_reads`、`files`、`audit_logs`、`system_settings`。用户属于部门；会话拥有成员；消息属于会话和发送者；文件元数据属于会话和上传者；已读是消息与用户的关系。
 
-## 数据库核心表
+## 6. 安全边界
 
-`users`、`departments`、`department_change_requests`、`user_sessions`、`conversations`、`conversation_members`、`messages`、`message_reads`、`files`、`audit_logs`、`system_settings`。
+生产环境必须使用强 `JWT_SECRET`、数据库密码和 MinIO 密码，`.env` 不入 Git。WebSocket 使用 Bearer 凭证或 `bearer` 子协议；Origin 仅允许受信任客户端。正式环境启用 HTTPS。管理员默认不能查看全部聊天，只能在指定会话授权后查看并留下审计记录。
 
-## 演进顺序
+## 7. 部署、备份与演进
 
-1. 账号/审核/登录与健康检查。
-2. 会话、消息、WebSocket 与分页。
-3. 文件上传、预览元数据和客户端直连协议。
-4. Electron 客户端完整聊天界面。
-5. 备份恢复、HTTPS、AI 指定会话转发、VPN 运维。
+服务器入口为 `deploy/server/install.ps1`，它校验 `.env`、构建 Go 镜像并启动四个容器；停止用 `stop.ps1`。客户端入口为 `installer/Intrachat.iss`。后续补充 Nginx HTTPS、SMB/另一台电脑备份、数据库和 MinIO 一键恢复、VPN、真实 MinIO 分片上传、客户端直连文件服务和 AI 指定会话转发。
 
-## 当前交付边界
+## 8. 当前实现边界
 
-已交付的是可启动的基础纵向切片：认证、审核、会话/消息 REST、WebSocket、数据库迁移、客户端登录和基础聊天界面。文件接口目前完成存储模式登记和 10GB 校验，真实 MinIO 分片上传、客户端大文件直连、完整管理员页面及消息高级能力仍按演进顺序实现，不能将当前客户端安装包理解为功能完整的微信替代品。
+当前交付已覆盖账号/审核基础链路、会话/消息 REST、WebSocket 服务、迁移、基础客户端界面和文件策略登记；客户端注册/管理员界面、完整群管理、真实文件传输、预览、备份恢复和 AI 转发仍按演进顺序实现。
+
